@@ -25,12 +25,20 @@ typedef struct input {
 	size_t alloc;
 } input_t;
 
+static const char *open_delim = "([";
+static const char *close_delim = ".,:;)]?!";
+
 static const char r_xrstr[] =
    "\\\\fB\\([.A-Za-z0-9_-]\\{1,\\}\\)\\\\fR(\\([1-9][A-Z]*\\))";
 static regex_t r_xr; /* cross reference */
 
+static regex_t *r_syms;
+static size_t n_syms;
+
 static void *zalloc(size_t);
 static char *xasprintf(const char *, ...);
+static char *xstrdup(const char *);
+static void add_symbols(const char *);
 static void input_resv(input_t *, size_t);
 static void insert_line(input_t *, size_t, char *);
 static void split_line(input_t *, size_t, size_t);
@@ -40,20 +48,41 @@ static boolean_t starts_with(const char *, const char *);
 static void cross_references(input_t *);
 static void split_paragraphs(input_t *);
 static void simple(input_t *);
+static void code(input_t *);
+static void syms(input_t *);
+
+static void
+usage(const char *progname)
+{
+	(void) fprintf(stderr, "Usage: %s [-s sym] file\n", progname);
+	exit(EXIT_FAILURE);
+}
 
 int
-main(int argc, const char **argv)
+main(int argc, char * const *argv)
 {
 	input_t *in = NULL;
+	int c;
 
-	fprintf(stderr, "%s\n", r_xrstr);
+	while ((c = getopt(argc, argv, "s:")) != -1) {
+		switch(c) {
+		case 's':
+			add_symbols(optarg);
+			break;
+		case '?':
+			usage(argv[0]);
+		}
+	}
+
 	VERIFY0(regcomp(&r_xr, r_xrstr, 0));
 
-	in = read_file(argv[1]);
+	in = read_file(argv[optind]);
 
 	cross_references(in);
+	syms(in);
 	split_paragraphs(in);
 	simple(in);
+	code(in);
 
 	for (size_t i = 0; i < in->nlines; i++)
 		(void) printf("%s", in->lines[i]);
@@ -97,17 +126,18 @@ split_paragraphs(input_t *in)
 			continue;
 
 		p++;	/* skip over . */
-		while (isspace(*p))
+		while (*p != '\0' && isspace(*p))
 			p++;
 
-		split_line(in, i, (p - line));
+		if (*p != '\0') {
+			split_line(in, i, (p - line));
+			/* trim trailing whitespace from old line */
+			while (p > line && isspace(p[-1]))
+				p--;
 
-		/* trim trailing whitespace from old line */
-		while (p > line && isspace(p[-1]))
-			p--;
-
-		p[0] = '\n';
-		p[1] = '\0';
+			p[0] = '\n';
+			p[1] = '\0';
+		}
 	}
 }
 
@@ -115,10 +145,12 @@ static void
 cross_references(input_t *in)
 {
 	boolean_t skip = B_FALSE;
+
 	for (size_t i = 0; i < in->nlines; i++) {
 		char *line = in->lines[i];
 		int rc;
 
+		/* Skip over non-formatted (.nf) spans of text */
 		if (skip) {
 			if (starts_with(line, ".fi"))
 				skip = B_FALSE;
@@ -146,31 +178,119 @@ cross_references(input_t *in)
 			continue;
 		}
 
+		/*
+		 * Have what appears to be a cross reference.  Grab the
+		 * name and section from the regex.  We want to take something
+		 * like:
+		 * 	blah blah \fBname(section)\fR blah blah
+		 * and split it at the start of the cross reference and
+		 * at the end of the cross reference, so the \fB...\fR can
+		 * be replaced with a cross reference.
+		 */
 		size_t linenum = i;
 		size_t namelen = match[1].rm_eo - match[1].rm_so + 1;
 		size_t seclen = match[2].rm_eo - match[2].rm_so + 1;
+		size_t sfxlen = 0;
 		char name[namelen];
 		char sec[seclen];
 		char *xrline = NULL;
-		char *end = "";
+		char *end = line + match[0].rm_eo;
+		char prefix[5] = "";
+		char suffix[17] = "";
+		boolean_t check_next = B_FALSE;
 
-		if (line[match[0].rm_eo] == '.')
-			end = " .";
-		if (line[match[0].rm_eo] == ',')
-			end = " ,";
+		if ((sfxlen = strspn(end, close_delim)) > 0) {
+			for (size_t j = 0; j < sfxlen; j++) {
+				suffix[j * 2] = ' ';
+				suffix[j * 2 + 1] = end[j];
+			}
+			suffix[sfxlen * 2] = '\0';
+		}
 
 		(void) strlcpy(name, &line[match[1].rm_so], namelen);
 		(void) strlcpy(sec, &line[match[2].rm_so], seclen);
 
-		xrline = xasprintf(".Xr %s %s%s\n", name, sec, end);
+		xrline = xasprintf(".Xr %s%s %s%s\n", prefix, name, sec,
+		    suffix);
 
+		/* Split line at the end of the match */
+		if (line[match[0].rm_eo] != '\n') {
+			check_next = B_TRUE;
+			split_line(in, linenum, match[0].rm_eo);
+		}
+
+		/*
+		 * If match is not at the start of the line, split at the
+		 * start of the match.  Also advance linenum.
+		 */
 		if (match[0].rm_so > 1)
 			split_line(in, linenum++, match[0].rm_so);
 
-		split_line(in, linenum, match[0].rm_eo - match[0].rm_so);
+		/* Replace \fBname(SEC)\fR line with .Xr line */
 		delete_line(in, linenum);
 		insert_line(in, linenum, xrline);
+
+		if (check_next) {
+			char *nextline = in->lines[linenum + 1];
+			char *p = nextline + strspn(nextline, close_delim);
+
+			VERIFY3S(nextline[0], !=, '\0');
+
+			while (*p != '\0' && isspace(*p))
+				p++;
+
+			if (*p == '\0') {
+				delete_line(in, linenum + 1);
+			} else {
+				size_t len = strlen(nextline);
+				size_t amt = (size_t)(p - nextline);
+				(void) memmove(nextline, p, len - amt);
+			}
+		}
 	}
+}
+
+/*
+ * Look for:
+ *     ...
+ *     .in +2
+ *     .nf
+ *     .... Code block ...
+ *     .fi
+ *     .in -2
+ * and replace with
+ *     .Bd -literal -offset 2n
+ *     ... Code block ....
+ *     .Ed
+ */
+static void
+code(input_t *in)
+{
+	boolean_t in_code = B_FALSE;
+	for (size_t i = 0; i < in->nlines; i++) {
+		char *line = in->lines[i];
+		char *nextline = in->lines[i + 1];
+
+		if (!in_code && starts_with(line, ".in +2") &&
+		    nextline != NULL && starts_with(nextline, ".nf")) {
+			in_code = B_TRUE;
+			free(line);
+			in->lines[i] = xstrdup(".Bd -literal -offset 2n\n");
+			delete_line(in, i + 1);
+			continue;
+		}
+
+		if (in_code && starts_with(line, ".fi") &&
+		    nextline != NULL && starts_with(nextline, ".in -2")) {
+			in_code = B_FALSE;
+			line[1] = 'E';
+			line[2] = 'd';
+			delete_line(in, i + 1);
+			continue;
+		}
+	}
+
+	VERIFY(!in_code);
 }
 
 static size_t
@@ -220,6 +340,77 @@ do_name(input_t *in, size_t linenum)
 		return;
 
 	descline = xasprintf(".Nd %s\n", pos + 4);
+}
+
+static void
+syms(input_t *in)
+{
+	if (n_syms == 0)
+		return;
+
+	for (size_t i = 0; i < in->nlines; i++) {
+		for (size_t j = 0; j < n_syms; j++) {
+			char *line = in->lines[i];
+			regmatch_t match[2] = { 0 };
+
+			switch (regexec(&r_syms[j], line, 2, match, 0)) {
+			case 0:
+				break;
+			case REG_NOMATCH:
+				continue;
+			default:
+				fprintf(stderr, "regexec failed\n");
+				continue;
+			}
+
+			char *symline = NULL;
+			char *end = line + match[0].rm_eo;
+			size_t symlen = match[1].rm_eo - match[1].rm_so + 1;
+			size_t sfxlen = 0;
+			char suffix[17] = "";
+			char sym[symlen];
+			boolean_t check_next = B_FALSE;
+
+			if ((sfxlen = strspn(end, close_delim)) > 0) {
+				for (size_t k = 0; k < sfxlen; k++) {
+					suffix[k * 2] = ' ';
+					suffix[k * 2 + 1] = end[k];
+				}
+				suffix[sfxlen * 2] = '\0';
+			}
+
+			(void) strlcpy(sym, &line[match[1].rm_so], symlen);
+			symline = xasprintf(".Sy %s%s\n", sym, suffix);
+
+			if (line[match[0].rm_eo] != '\n') {
+				check_next = B_TRUE;
+				split_line(in, i, match[0].rm_eo);
+			}
+
+			if (match[0].rm_so > 1)
+				split_line(in, i++, match[0].rm_so);
+
+			delete_line(in, i);
+			insert_line(in, i, symline);
+
+			if (check_next) {
+				char *nextline = in->lines[i + 1];
+				char *p = nextline +
+				    strspn(nextline, close_delim);
+
+				while (*p != '\0' && isspace(*p))
+					p++;
+
+				if (*p == '\0') {
+					delete_line(in, i + 1);
+				} else {
+					size_t len = strlen(nextline);
+					size_t amt = (size_t)(p - nextline);
+					(void) memmove(nextline, p, len - amt);
+				}
+			}
+		}
+	}
 }
 
 static void
@@ -352,7 +543,7 @@ read_file(const char *file)
 		err(EXIT_FAILURE, "Cannot open %s", file);
 
 	while ((n = getline(&buf, &len, f)) > 0) {
-		input_resv(in, 1);
+		input_resv(in, 2);
 		in->lines[in->nlines++] = buf;
 		buf = NULL;
 		len = 0;
@@ -428,6 +619,7 @@ input_resv(input_t *in, size_t n)
 	if (temp == NULL)
 		err(EXIT_FAILURE, "Out of memory");
 
+	(void) memset(temp + in->alloc, 0, CHUNK_SZ * sizeof (char *));
 	in->lines = temp;
 	in->alloc = newalloc;
 }
@@ -438,6 +630,23 @@ starts_with(const char *str, const char *chr)
 	if (strncmp(str, chr, strlen(chr)) == 0)
 		return (B_TRUE);
 	return (B_FALSE);
+}
+
+static void
+add_symbols(const char *str)
+{
+	regex_t r = { 0 };
+	char *regex_str = xasprintf("\\\\fB\\(%s\\)\\\\fR", str);
+	regex_t *new = realloc(r_syms, (n_syms + 1) * sizeof (regex_t));
+
+	if (new == NULL)
+		err(EXIT_FAILURE, "Out of memory");
+	r_syms = new;
+
+	if (regcomp(&r_syms[n_syms++], regex_str, 0) != 0)
+		err(EXIT_FAILURE, "Could not convert '%s' to regex", str);
+
+	free(regex_str);
 }
 
 static char *
@@ -455,6 +664,17 @@ xasprintf(const char *fmt, ...)
 		err(EXIT_FAILURE, "Out of memory");
 
 	return (str);
+}
+
+static char *
+xstrdup(const char *src)
+{
+	char *s = strdup(src);
+
+	if (s == NULL)
+		err(EXIT_FAILURE, "Out of memory");
+
+	return (s);
 }
 
 static void *
