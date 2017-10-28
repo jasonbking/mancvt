@@ -3,7 +3,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
-
+#include <alloca.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,8 +25,7 @@ typedef struct input {
 	size_t alloc;
 } input_t;
 
-static const char *open_delim = "([";
-static const char *close_delim = ".,:;)]?!";
+static const char *close_delim = ".,:;?!";
 
 static const char r_xrstr[] =
    "\\\\fB\\([.A-Za-z0-9_-]\\{1,\\}\\)\\\\fR(\\([1-9][A-Z]*\\))";
@@ -43,6 +42,8 @@ static void input_resv(input_t *, size_t);
 static void insert_line(input_t *, size_t, char *);
 static void split_line(input_t *, size_t, size_t);
 static void delete_line(input_t *, size_t);
+static void replace_with_cmd(input_t *restrict, size_t, size_t, size_t,
+    const char *restrict);
 static input_t *read_file(const char *);
 static boolean_t starts_with(const char *, const char *);
 static void cross_references(input_t *);
@@ -50,6 +51,7 @@ static void split_paragraphs(input_t *);
 static void simple(input_t *);
 static void code(input_t *);
 static void syms(input_t *);
+static void name(input_t *in);
 
 static void
 usage(const char *progname)
@@ -78,11 +80,12 @@ main(int argc, char * const *argv)
 
 	in = read_file(argv[optind]);
 
+	name(in);
 	cross_references(in);
 	syms(in);
-	split_paragraphs(in);
 	simple(in);
 	code(in);
+	split_paragraphs(in);
 
 	for (size_t i = 0; i < in->nlines; i++)
 		(void) printf("%s", in->lines[i]);
@@ -118,10 +121,19 @@ split_paragraphs(input_t *in)
 		if (starts_with(line, ".\\\""))
 			continue;
 
+		/* Ignore non-breaking space followed by . at start of line */
+		if (starts_with(line, "\\&."))
+			continue;
+
+		/* Skip lines that start with / */
 		if (line[0] == '.')
 			continue;
 		if ((p = strchr(line + 1, '.')) == NULL)
 			continue;
+		/* Skip escaped periods */
+		if (p[-1] == '\\')
+			continue;
+		/* Or . at the end of a line */
 		if (p[1] == '\n')
 			continue;
 
@@ -178,75 +190,16 @@ cross_references(input_t *in)
 			continue;
 		}
 
-		/*
-		 * Have what appears to be a cross reference.  Grab the
-		 * name and section from the regex.  We want to take something
-		 * like:
-		 * 	blah blah \fBname(section)\fR blah blah
-		 * and split it at the start of the cross reference and
-		 * at the end of the cross reference, so the \fB...\fR can
-		 * be replaced with a cross reference.
-		 */
-		size_t linenum = i;
-		size_t namelen = match[1].rm_eo - match[1].rm_so + 1;
-		size_t seclen = match[2].rm_eo - match[2].rm_so + 1;
-		size_t sfxlen = 0;
-		char name[namelen];
-		char sec[seclen];
-		char *xrline = NULL;
-		char *end = line + match[0].rm_eo;
-		char prefix[5] = "";
-		char suffix[17] = "";
-		boolean_t check_next = B_FALSE;
+		int xrlen = match[1].rm_eo - match[1].rm_so;
+		int seclen = match[2].rm_eo - match[2].rm_so;
+		size_t cmdlen = 3 /* 'Xr ' */ + xrlen + 1 + seclen + 2;
+		char cmd[cmdlen];
 
-		if ((sfxlen = strspn(end, close_delim)) > 0) {
-			for (size_t j = 0; j < sfxlen; j++) {
-				suffix[j * 2] = ' ';
-				suffix[j * 2 + 1] = end[j];
-			}
-			suffix[sfxlen * 2] = '\0';
-		}
+		(void) snprintf(cmd, cmdlen, "Xr %.*s %.*s",
+		    xrlen, line + match[1].rm_so,
+		    seclen, line + match[2].rm_so);
 
-		(void) strlcpy(name, &line[match[1].rm_so], namelen);
-		(void) strlcpy(sec, &line[match[2].rm_so], seclen);
-
-		xrline = xasprintf(".Xr %s%s %s%s\n", prefix, name, sec,
-		    suffix);
-
-		/* Split line at the end of the match */
-		if (line[match[0].rm_eo] != '\n') {
-			check_next = B_TRUE;
-			split_line(in, linenum, match[0].rm_eo);
-		}
-
-		/*
-		 * If match is not at the start of the line, split at the
-		 * start of the match.  Also advance linenum.
-		 */
-		if (match[0].rm_so > 1)
-			split_line(in, linenum++, match[0].rm_so);
-
-		/* Replace \fBname(SEC)\fR line with .Xr line */
-		delete_line(in, linenum);
-		insert_line(in, linenum, xrline);
-
-		if (check_next) {
-			char *nextline = in->lines[linenum + 1];
-			char *p = nextline + strspn(nextline, close_delim);
-
-			VERIFY3S(nextline[0], !=, '\0');
-
-			while (*p != '\0' && isspace(*p))
-				p++;
-
-			if (*p == '\0') {
-				delete_line(in, linenum + 1);
-			} else {
-				size_t len = strlen(nextline);
-				size_t amt = (size_t)(p - nextline);
-				(void) memmove(nextline, p, len - amt);
-			}
-		}
+		replace_with_cmd(in, i, match[0].rm_so, match[0].rm_eo, cmd);
 	}
 }
 
@@ -328,18 +281,56 @@ do_th(input_t *in, size_t linenum)
 	return (2);
 }
 
-static void
-do_name(input_t *in, size_t linenum)
+static size_t
+do_nameline(input_t *in, size_t linenum)
 {
 	char *line = in->lines[linenum];
 	char *pos = strstr(line, " \\- ");
 	char *nameline = NULL;
 	char *descline = NULL;
+	size_t count = 0;
 
 	if (pos == NULL)
-		return;
+		return (0);
 
-	descline = xasprintf(".Nd %s\n", pos + 4);
+	pos[0] = '\0';
+	descline = xasprintf(".Nd %s", pos + 4);
+	insert_line(in, linenum + 1, descline);
+
+	for (char *nm = strtok(line, ", ");
+	    nm != NULL;
+	    nm = strtok(NULL, ", ")) {
+		nameline = xasprintf(".Nm %s\n", nm);
+		insert_line(in, linenum + count + 1, nameline);
+		count++;
+	}
+	delete_line(in, linenum);
+
+	return (count);
+}
+
+static void
+name(input_t *in)
+{
+	boolean_t in_sect = B_FALSE;
+
+	for (size_t i = 0; i < in->nlines; i++) {
+		char *line = in->lines[i];
+
+		if (!in_sect) {
+			if (starts_with(line, ".Sh NAME") ||
+			    starts_with(line, ".SH NAME"))
+				in_sect = B_TRUE;
+			continue;
+		}
+
+		if (starts_with(line, ".Sh") || starts_with(line, ".SH"))
+			break;
+
+		i += do_nameline(in, i);
+
+		/* TODO: search other sections for names and replace with Nm */
+	}
 }
 
 static void
@@ -363,52 +354,15 @@ syms(input_t *in)
 				continue;
 			}
 
-			char *symline = NULL;
-			char *end = line + match[0].rm_eo;
-			size_t symlen = match[1].rm_eo - match[1].rm_so + 1;
-			size_t sfxlen = 0;
-			char suffix[17] = "";
-			char sym[symlen];
-			boolean_t check_next = B_FALSE;
+			int matchlen = match[1].rm_eo - match[1].rm_so;
+			size_t cmdlen = matchlen + 4;
+			char cmd[cmdlen];
 
-			if ((sfxlen = strspn(end, close_delim)) > 0) {
-				for (size_t k = 0; k < sfxlen; k++) {
-					suffix[k * 2] = ' ';
-					suffix[k * 2 + 1] = end[k];
-				}
-				suffix[sfxlen * 2] = '\0';
-			}
+			(void) snprintf(cmd, cmdlen, "Sy %.*s", matchlen,
+			    line + match[1].rm_so);
 
-			(void) strlcpy(sym, &line[match[1].rm_so], symlen);
-			symline = xasprintf(".Sy %s%s\n", sym, suffix);
-
-			if (line[match[0].rm_eo] != '\n') {
-				check_next = B_TRUE;
-				split_line(in, i, match[0].rm_eo);
-			}
-
-			if (match[0].rm_so > 1)
-				split_line(in, i++, match[0].rm_so);
-
-			delete_line(in, i);
-			insert_line(in, i, symline);
-
-			if (check_next) {
-				char *nextline = in->lines[i + 1];
-				char *p = nextline +
-				    strspn(nextline, close_delim);
-
-				while (*p != '\0' && isspace(*p))
-					p++;
-
-				if (*p == '\0') {
-					delete_line(in, i + 1);
-				} else {
-					size_t len = strlen(nextline);
-					size_t amt = (size_t)(p - nextline);
-					(void) memmove(nextline, p, len - amt);
-				}
-			}
+			replace_with_cmd(in, i, match[0].rm_so, match[0].rm_eo,
+			    cmd);
 		}
 	}
 }
@@ -465,6 +419,64 @@ again:
 	}
 }
 
+/*
+ * Replaces span of line with a given command, including breaking line as
+ * necessary, and handle any leading or trailing delimiters
+ */
+static void
+replace_with_cmd(input_t *restrict in, size_t linenum, size_t start, size_t end,
+    const char *restrict cmd)
+{
+	char *line = in->lines[linenum];
+	char *cmdline = NULL;
+	char *p = NULL;
+	char *suffix = NULL;
+	size_t len = strlen(line);
+
+	/*
+	 * If the command not at the end of the line, look for any
+	 * delimiters after the end of the command we're replacing and
+	 * fill suffix with them, then split the line after any subsequence
+	 * whitespace so something like '..... \fBfoo(1M)\fR. Foobar ...'
+	 * will set suffix to ' .' and split the line so the next line starts
+	 * with 'Foobar'.
+	 */
+	if (end < len - 1) {
+		const char *endp = line + end;
+		size_t seplen = 0;
+
+		if ((seplen = strspn(endp, close_delim)) > 0) {
+			suffix = alloca(seplen * 2 + 1);
+			for (size_t i = 0; i < seplen; i++) {
+				suffix[i * 2] = ' ';
+				suffix[i * 2 + 1] = endp[i];
+			}
+			suffix[seplen * 2] = '\0';
+		}
+
+		end += seplen;
+		while (isspace(line[end]))
+			end++;
+
+		if (end != len)
+			split_line(in, linenum, end);
+	}
+
+	if (start > 0) {
+		while (start > 0 && isspace(line[start]))
+			start--;
+
+		if (start > 0) {
+			split_line(in, linenum++, start);
+			line = in->lines[linenum];
+		}
+	}
+
+	cmdline = xasprintf(".%s%s\n", cmd, (suffix != NULL) ? suffix : "");
+	free(line);
+	in->lines[linenum] = cmdline;
+}
+
 static void
 delete_line(input_t *in, size_t linenum)
 {
@@ -500,6 +512,7 @@ insert_line(input_t *in, size_t linenum, char *newline)
 	in->nlines++;
 }
 
+/* Break line at col, character at line[col] becomes start of new line */
 static void
 split_line(input_t *in, size_t linenum, size_t col)
 {
