@@ -73,7 +73,8 @@ static void simple(input_t *);
 static void code(input_t *);
 static void subs(input_t *);
 static void name(input_t *in);
-void extra_spaces(input_t *);
+static void extra_spaces(input_t *);
+static void blank_lines(input_t *);
 
 static void
 usage(const char *progname)
@@ -118,6 +119,7 @@ main(int argc, char * const *argv)
 	code(in);
 	split_paragraphs(in);
 	extra_spaces(in);
+	blank_lines(in);
 
 	for (size_t i = 0; i < in->nlines; i++)
 		(void) printf("%s", in->lines[i]);
@@ -480,6 +482,37 @@ extra_spaces(input_t *in)
 				len -= amt;
 			}
 		}
+	}
+}
+
+static void
+blank_lines(input_t *in)
+{
+	boolean_t skip = B_FALSE;
+
+	for (size_t i = 0; i < in->nlines; i++) {
+		char *line = in->lines[i];
+		char *p = line;
+		size_t len = strlen(line);
+
+		if (skip) {
+			if (starts_with(line, ".Ed") ||
+			    starts_with(line, ".fi"))
+				skip = B_FALSE;
+			continue;
+		}
+
+		if (starts_with(line, ".nf") ||
+		    starts_with(line, ".Bd")) {
+			skip = B_TRUE;
+			continue;
+		}
+
+		while (*p != '\0' && isspace(*p))
+			p++;
+
+		if (*p == '\0')
+			delete_line(in, i--);
 	}
 }
 
