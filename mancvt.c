@@ -19,39 +19,61 @@
 
 #define	CHUNK_SZ	(128)
 
+#ifndef ARRAY_SIZE
+#define	ARRAY_SIZE(a)	(sizeof (a) / sizeof (a[0]))
+#endif
+
 typedef struct input {
 	char **lines;
 	size_t nlines;
 	size_t alloc;
 } input_t;
 
-static const char *close_delim = ".,:;?!";
+static const char *close_delim = ".,:;?!)]";
 
 static const char r_xrstr[] =
    "\\\\fB\\([.A-Za-z0-9_-]\\{1,\\}\\)\\\\fR(\\([1-9][A-Z]*\\))";
 static regex_t r_xr; /* cross reference */
 
-static regex_t *r_syms;
-static size_t n_syms;
+enum {
+	SYMBOLS,
+	VARIABLES,
+	DEFINES,
+	TYPES
+};
+
+static struct {
+	const char *templ;
+	const char *cmd;
+	regex_t *regex;
+	size_t nregex;
+} subtbl[] = {
+	{ "\\\\fB\\(%s\\)\\\\fR", "Sy", NULL, 0 },
+	{ "\\\\fI\\(%s\\)\\\\fR", "Va", NULL, 0 },
+	{ "\\\\fB\\(%s\\)\\\\fR", "Dv", NULL, 0 },
+	{ "\\\\fB\\(%s\\)\\\\fR", "Vt", NULL, 0 }
+};
 
 static void *zalloc(size_t);
 static char *xasprintf(const char *, ...);
 static char *xstrdup(const char *);
-static void add_symbols(const char *);
+static void add_sub(int, const char *);
 static void input_resv(input_t *, size_t);
 static void insert_line(input_t *, size_t, char *);
 static void split_line(input_t *, size_t, size_t);
 static void delete_line(input_t *, size_t);
 static void replace_with_cmd(input_t *restrict, size_t, size_t, size_t,
     const char *restrict);
+static void check_regexes(input_t *, size_t, const char *, regex_t *, size_t);
 static input_t *read_file(const char *);
 static boolean_t starts_with(const char *, const char *);
 static void cross_references(input_t *);
 static void split_paragraphs(input_t *);
 static void simple(input_t *);
 static void code(input_t *);
-static void syms(input_t *);
+static void subs(input_t *);
 static void name(input_t *in);
+void extra_spaces(input_t *);
 
 static void
 usage(const char *progname)
@@ -66,10 +88,19 @@ main(int argc, char * const *argv)
 	input_t *in = NULL;
 	int c;
 
-	while ((c = getopt(argc, argv, "s:")) != -1) {
+	while ((c = getopt(argc, argv, "D:s:t:v:")) != -1) {
 		switch(c) {
+		case 'D':
+			add_sub(DEFINES, optarg);
+			break;
 		case 's':
-			add_symbols(optarg);
+			add_sub(SYMBOLS, optarg);
+			break;
+		case 't':
+			add_sub(TYPES, optarg);
+			break;
+		case 'v':
+			add_sub(VARIABLES, optarg);
 			break;
 		case '?':
 			usage(argv[0]);
@@ -82,10 +113,11 @@ main(int argc, char * const *argv)
 
 	name(in);
 	cross_references(in);
-	syms(in);
+	subs(in);
 	simple(in);
 	code(in);
 	split_paragraphs(in);
+	extra_spaces(in);
 
 	for (size_t i = 0; i < in->nlines; i++)
 		(void) printf("%s", in->lines[i]);
@@ -334,35 +366,25 @@ name(input_t *in)
 }
 
 static void
-syms(input_t *in)
+subs(input_t *in)
 {
-	if (n_syms == 0)
-		return;
+	boolean_t skip = B_FALSE;
 
 	for (size_t i = 0; i < in->nlines; i++) {
-		for (size_t j = 0; j < n_syms; j++) {
-			char *line = in->lines[i];
-			regmatch_t match[2] = { 0 };
+		if (skip) {
+			if (starts_with(in->lines[i], ".fi"))
+				skip = B_FALSE;
+			continue;
+		}
 
-			switch (regexec(&r_syms[j], line, 2, match, 0)) {
-			case 0:
-				break;
-			case REG_NOMATCH:
-				continue;
-			default:
-				fprintf(stderr, "regexec failed\n");
-				continue;
-			}
+		if (starts_with(in->lines[i], ".nf")) {
+			skip = B_TRUE;
+			continue;
+		}
 
-			int matchlen = match[1].rm_eo - match[1].rm_so;
-			size_t cmdlen = matchlen + 4;
-			char cmd[cmdlen];
-
-			(void) snprintf(cmd, cmdlen, "Sy %.*s", matchlen,
-			    line + match[1].rm_so);
-
-			replace_with_cmd(in, i, match[0].rm_so, match[0].rm_eo,
-			    cmd);
+		for (size_t j = 0; j < ARRAY_SIZE(subtbl); j++) {
+			check_regexes(in, i, subtbl[j].cmd, subtbl[j].regex,
+			    subtbl[j].nregex);
 		}
 	}
 }
@@ -415,6 +437,48 @@ again:
 		if (starts_with(line, ".TH ")) {
 			do_th(in, i);
 			continue;
+		}
+	}
+}
+
+static void
+extra_spaces(input_t *in)
+{
+	boolean_t skip = B_FALSE;
+
+	for (size_t i = 0; i < in->nlines; i++) {
+		char *line = in->lines[i];
+		size_t len = strlen(line);
+
+		if (skip) {
+			if (starts_with(line, ".Ed") ||
+			    starts_with(line, ".fi"))
+				skip = B_FALSE;
+			continue;
+		}
+
+		if (starts_with(line, ".nf") ||
+		    starts_with(line, ".Bd")) {
+			skip = B_TRUE;
+			continue;
+		}
+
+		if (line[0] == '.')
+			continue;
+
+		for (char *p = line; p[0] != '\0'; p++) {
+			if (p[0] != ' ')
+				continue;
+
+			char *start = p;
+			while (p[1] == ' ')
+				p++;
+
+			if (p - start > 0) {
+				size_t amt = (size_t)(p - start);
+				(void) memmove(start, p, len - amt);
+				len -= amt;
+			}
 		}
 	}
 }
@@ -475,6 +539,36 @@ replace_with_cmd(input_t *restrict in, size_t linenum, size_t start, size_t end,
 	cmdline = xasprintf(".%s%s\n", cmd, (suffix != NULL) ? suffix : "");
 	free(line);
 	in->lines[linenum] = cmdline;
+}
+
+static void
+check_regexes(input_t *in, size_t linenum, const char *cmd,
+    regex_t *regexes, size_t nregex)
+{
+	for (size_t i = 0; i < nregex; i++) {
+		char *line = in->lines[linenum];
+		regmatch_t match[2] = { 0 };
+
+		switch (regexec(&regexes[i], line, 2, match, 0)) {
+		case 0:
+			break;
+		case REG_NOMATCH:
+			continue;
+		default:
+			(void) fprintf(stderr, "regex failed\n");
+			continue;
+		}
+
+		int matchlen = match[1].rm_eo - match[1].rm_so + 1;
+		size_t cmdlen = matchlen + strlen(cmd) + 1;
+		char cmdstr[cmdlen];
+
+		(void) snprintf(cmdstr, cmdlen, "%s %.*s", cmd, matchlen,
+		    line + match[1].rm_so);
+
+		replace_with_cmd(in, linenum, match[0].rm_so, match[0].rm_eo,
+		    cmdstr);
+	}
 }
 
 static void
@@ -646,20 +740,21 @@ starts_with(const char *str, const char *chr)
 }
 
 static void
-add_symbols(const char *str)
+add_sub(int which, const char *str)
 {
 	regex_t r = { 0 };
-	char *regex_str = xasprintf("\\\\fB\\(%s\\)\\\\fR", str);
-	regex_t *new = realloc(r_syms, (n_syms + 1) * sizeof (regex_t));
+	char *rstr = xasprintf(subtbl[which].templ, str);
+	regex_t *new = realloc(subtbl[which].regex,
+	    (subtbl[which].nregex + 1) * sizeof (regex_t));
 
 	if (new == NULL)
 		err(EXIT_FAILURE, "Out of memory");
-	r_syms = new;
+	subtbl[which].regex = new;
 
-	if (regcomp(&r_syms[n_syms++], regex_str, 0) != 0)
+	if (regcomp(&subtbl[which].regex[subtbl[which].nregex++], rstr, 0) != 0)
 		err(EXIT_FAILURE, "Could not convert '%s' to regex", str);
 
-	free(regex_str);
+	free(rstr);
 }
 
 static char *
