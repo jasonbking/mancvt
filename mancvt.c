@@ -15,7 +15,19 @@
 #include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <unistd.h>
+
+#ifdef __sun
 #include <sys/debug.h>
+#else
+#include <stdbool.h>
+#define VERIFY0(x) (void) x
+#define VERIFY(x) (void) x
+#define VERIFY3U(a, b, c)
+typedef bool boolean_t;
+#define B_FALSE false
+#define B_TRUE true
+#endif
 
 #define	CHUNK_SZ	(128)
 
@@ -290,11 +302,13 @@ do_th(input_t *in, size_t linenum)
 	char *os = strdup(".Os\n");
 	size_t cnt = 0;
 	time_t now = time(NULL);
+    struct tm *now_tm;
 
 	if (os == NULL)
 		err(EXIT_FAILURE, "Out of memory");
 
-	(void) cftime(datestr, "%b %e, %Y", &now);
+    now_tm = localtime(&now);
+    (void) strftime(datestr, sizeof (datestr) - 1, "%b %e, %Y", now_tm);
 
 	for (p = line; *p != '\0'; p++) {
 		if (*p == ' ' && ++cnt == 3)
@@ -823,7 +837,7 @@ zalloc(size_t len)
 {
 	void *p = calloc(1, len);
 
-	if (len == NULL)
+	if (p == NULL)
 		err(EXIT_FAILURE, "Out of memory");
 
 	return (p);
