@@ -87,6 +87,7 @@ static void subs(input_t *);
 static void name(input_t *in);
 static void extra_spaces(input_t *);
 static void blank_lines(input_t *);
+static void synopsis(input_t *);
 
 static void
 usage(const char *progname)
@@ -128,6 +129,7 @@ main(int argc, char * const *argv)
 	cross_references(in);
 	subs(in);
 	simple(in);
+	synopsis(in);
 	code(in);
 	split_paragraphs(in);
 	extra_spaces(in);
@@ -527,6 +529,43 @@ blank_lines(input_t *in)
 
 		if (*p == '\0')
 			delete_line(in, i--);
+	}
+}
+
+static void
+synopsis(input_t *in)
+{
+	size_t i;
+	boolean_t in_synopsis = B_FALSE;
+
+	for (i = 0; i < in->nlines; i++) {
+again:
+		if (starts_with(in->lines[i], ".Sh SYNOPSIS")) {
+			in_synopsis = B_TRUE;
+			continue;
+		}
+		if (!in_synopsis)
+			continue;
+		if (starts_with(in->lines[i], ".Sh"))
+			break;
+
+		if (starts_with(in->lines[i], ".LP") ||
+		    starts_with(in->lines[i], ".nf") ||
+		    starts_with(in->lines[i], ".fi")) {
+			delete_line(in, i);
+			goto again;
+		}
+
+		if (starts_with(in->lines[i], "#include ")) {
+			char *start = strchr(in->lines[i], '<');
+			char *end = strchr(in->lines[i], '>');
+			char *new = xasprintf(".In %.*s\n", (int) (end - start - 1),
+			    start + 1);
+
+			free(in->lines[i]);
+			in->lines[i] = new;
+			continue;
+		}
 	}
 }
 
