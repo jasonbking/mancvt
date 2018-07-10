@@ -4,7 +4,9 @@
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 
+CC = gcc
 CPPFLAGS = -D__EXTENSIONS__
 CFLAGS = -std=c99 -g
 
-mancvt: mancvt.c
+mancvt: mancvt.o
+	$(CC) -o mancvt mancvt.o
