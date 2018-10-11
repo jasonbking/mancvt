@@ -310,7 +310,7 @@ do_th(input_t *in, size_t linenum)
 		err(EXIT_FAILURE, "Out of memory");
 
     now_tm = localtime(&now);
-    (void) strftime(datestr, sizeof (datestr) - 1, "%b %e, %Y", now_tm);
+    (void) strftime(datestr, sizeof (datestr) - 1, "%B %e, %Y", now_tm);
 
 	for (p = line; *p != '\0'; p++) {
 		if (*p == ' ' && ++cnt == 3)
